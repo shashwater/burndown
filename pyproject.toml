@@ -1,0 +1,10 @@
+[project]
+name = "burndown"
+version = "0.1.0"
+description = "Usage-based billing engine for AI APIs: idempotent ledger, meters, tiered pricing, credit burndown, invoices"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
