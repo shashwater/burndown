@@ -25,7 +25,7 @@ def main():
             "customer_id": "c_bench",
             "meter": "input_tokens" if i % 2 == 0 else "output_tokens",
             "quantity": rng.randint(1_000, 500_000),
-            "timestamp": 1761955200.0 + (i % 86_400),
+            "timestamp": 1761955200.0 + i,
         }
         for i in range(args.events)
     ]

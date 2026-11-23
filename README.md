@@ -42,7 +42,7 @@ testable invariants.
 ```
 python demo.py                          # a month of AI API traffic, end to end
 python bench.py --events 200000         # throughput micro-benchmark
-python -m unittest discover -s tests    # 27 tests
+python -m unittest discover -s tests    # 29 tests
 python -m burndown.server --port 8080   # ingest API
 ```
 
@@ -90,17 +90,26 @@ per million units, so `quantity * cents_per_million` is exact integer math
 and rounding only happens once, at display.
 
 Live state (balances, accrual) is an incremental cache; the ledger is the
-source of truth, and invoices are always computed as a pure replay over it.
-The cache stays correct under out-of-order delivery: same-period reordering
-is provably harmless (per-grant burn totals are arrival-order invariant -
-there is a randomized test over 75 shuffled interleavings), and an accepted
-event dated in an *earlier* billing period triggers a targeted re-anchor -
-a replay of just that customer's history - so balances, billing, and credit
-attribution never go stale. `reconcile()` remains as a full audit: it
-rebuilds all state from the ledger and must always report a match, and
-handed the producer's copy of the stream it reports exactly which event ids
-were lost. This mirrors the split Stripe describes between real-time
-ratings and reconciliation.
+source of truth, and invoices are computed as a pure replay over it.
+
+Out-of-order delivery is handled by re-anchoring: when a customer with
+credit grants accepts an event older than one already applied, the engine
+replays that customer's history in event-time order. This matters because
+with graduated pricing an event's marginal cost depends on accumulation
+order, and grant eligibility depends on event time - so arrival order could
+otherwise change which grant a charge burns from. Customers without grants
+are unaffected by ordering and skip the replay, so in-order streams never
+pay for it.
+
+Tested behavior (not a proof): hand-computed scenarios whose expected
+credit assignment was worked out independently of the engine - including
+same-month events straddling a grant's expiry - plus 75 randomized shuffled
+interleavings across customers, months, and expiring grants, all matching
+timestamp-ordered ingestion exactly; and `reconcile()`, a full audit
+rebuild from the ledger, reporting no drift on every suite run. Given the
+producer's copy of the stream, `reconcile()` also reports exactly which
+event ids were lost. This mirrors the split Stripe describes between
+real-time ratings and reconciliation.
 
 What this deliberately does **not** implement: the distributed
 infrastructure from the Stripe post - no event bus, no stream processor, no

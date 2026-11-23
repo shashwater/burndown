@@ -106,7 +106,7 @@ class Engine:
         self._qty: dict = {}     # (customer, period, meter) -> units
         self._billed: dict = {}  # (customer, period) -> overage microcents
         self._burned: dict = {}  # (customer, period) -> credits burned microcents
-        self._max_period: dict = {}  # customer -> latest billing period applied
+        self._max_ts: dict = {}  # customer -> latest event timestamp applied
 
     # --- setup -----------------------------------------------------------
 
@@ -147,18 +147,23 @@ class Engine:
         return IngestResult("accepted", event_id=ev.event_id)
 
     def _apply(self, ev: UsageEvent) -> None:
-        period = period_of(ev.timestamp)
-        max_period = self._max_period.get(ev.customer_id)
-        if max_period is not None and period < max_period:
-            # Cross-period out-of-order delivery: an earlier-month event can
-            # change how shared credit grants SHOULD have been attributed.
-            # Same-period reordering is provably harmless (burn totals are
-            # arrival-order invariant), but cross-period is not, so re-anchor
-            # this customer's live state from the ledger. No read can ever
-            # return stale money.
+        max_ts = self._max_ts.get(ev.customer_id)
+        if (
+            max_ts is not None
+            and ev.timestamp < max_ts
+            and any(g.customer_id == ev.customer_id for g in self.grants)
+        ):
+            # Out-of-order delivery for a customer with credit grants. With
+            # graduated pricing, an event's marginal cost depends on
+            # accumulation order, and grant eligibility depends on event
+            # time - so arrival order can change per-grant attribution and
+            # even the remaining balance. Re-anchor this customer's live
+            # state from the ledger: a targeted replay in event-time order,
+            # so every later read reflects timestamp order, not arrival luck.
+            # Customers without grants are order-invariant and skip this.
             self._rebuild_customer(ev.customer_id)
             return
-        self._max_period[ev.customer_id] = period if max_period is None else max(period, max_period)
+        self._max_ts[ev.customer_id] = ev.timestamp if max_ts is None else max(max_ts, ev.timestamp)
         self._apply_incremental(ev)
 
     def _apply_incremental(self, ev: UsageEvent) -> None:
@@ -178,14 +183,15 @@ class Engine:
         for g in self.grants:
             if g.customer_id == customer_id:
                 g.remaining_micro = g.cents * MICRO
+        max_ts = None
         for ev in sorted(
             self.ledger.events(customer_id=customer_id),
             key=lambda e: (e.timestamp, e.event_id),
         ):
             self._apply_incremental(ev)
-            period = period_of(ev.timestamp)
-            if period > self._max_period.get(customer_id, ""):
-                self._max_period[customer_id] = period
+            max_ts = ev.timestamp if max_ts is None else max(max_ts, ev.timestamp)
+        if max_ts is not None:
+            self._max_ts[customer_id] = max_ts
 
     @staticmethod
     def _charge(customer_id, period, micro, now, grants, billed, burned) -> None:

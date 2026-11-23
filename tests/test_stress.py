@@ -219,5 +219,64 @@ class TestCrossPeriodReAnchor(unittest.TestCase):
         self.assertTrue(engine.reconcile()["matched"])
 
 
+class TestSamePeriodExpiryStraddle(unittest.TestCase):
+    """Same-month events shuffled across a grant's expiry, with graduated
+    pricing. Expected values below are derived here by hand, NOT from the
+    engine - this is the case where arrival order can corrupt per-grant
+    attribution if the engine does not re-anchor.
+
+    Grants: A = $100.00 expiring Nov 10 00:00 UTC, B = $20.00 no expiry.
+    Meter: output_tokens, $10/1M for the first 10M units, then $8/1M.
+
+      e1: Nov 5, 8M units. Timestamp order: first 8M units, all tier 1
+          -> $80.00. Grant A active on Nov 5 -> A burns $80 (left $20).
+      e2: Nov 12, 8M units. Marginal: 2M at $10/1M + 6M at $8/1M = $68.00.
+          A expired on Nov 12 -> B burns $20, $48.00 bills.
+
+    Correct final state: credits applied $100.00, amount due $48.00,
+    gross $148.00 (16M units = 10M*$10/1M + 6M*$8/1M), A remaining $20
+    (expired), B remaining $0, balance $0 on Nov 20. Intermediate state
+    after e1 alone: balance $40 (A $20 + B $20, both active on Nov 6).
+    Note balance_cents(now) filters grants by expiry as of `now`; it does
+    not rewind usage to `now`."""
+
+    E1 = ev("e1", "c_s", "output_tokens", 8_000_000, NOV1 + 4 * DAY)
+    E2 = ev("e2", "c_s", "output_tokens", 8_000_000, NOV1 + 11 * DAY)
+
+    def build(self, order):
+        engine = make_engine()
+        engine.add_credits("c_s", 10000, expires_at=NOV1 + 9 * DAY, grant_id="A")
+        engine.add_credits("c_s", 2000, grant_id="B")
+        for raw in order:
+            engine.ingest(raw)
+        return engine
+
+    def check_hand_computed(self, engine):
+        grants = {g.grant_id: g for g in engine.grants if g.customer_id == "c_s"}
+        self.assertEqual(grants["A"].remaining_micro, 2_000 * MICRO)   # $20 left, expired
+        self.assertEqual(grants["B"].remaining_micro, 0)
+        self.assertEqual(engine.balance_cents("c_s", now=NOV1 + 20 * DAY), 0)
+        inv = engine.invoice("c_s", "2025-11")
+        self.assertEqual(inv.gross_micro, 14_800 * MICRO)
+        self.assertEqual(inv.credits_applied_micro, 10_000 * MICRO)
+        self.assertEqual(inv.amount_due_micro, 4_800 * MICRO)
+        self.assertTrue(engine.reconcile()["matched"])
+
+    def test_timestamp_order(self):
+        engine = make_engine()
+        engine.add_credits("c_s", 10000, expires_at=NOV1 + 9 * DAY, grant_id="A")
+        engine.add_credits("c_s", 2000, grant_id="B")
+        engine.ingest(self.E1)
+        # intermediate state after e1 alone: $80 burned from A, $40 active balance
+        self.assertEqual(engine.balance_cents("c_s", now=NOV1 + 6 * DAY), 4_000)
+        engine.ingest(self.E2)
+        self.check_hand_computed(engine)
+
+    def test_arrival_order_reversed(self):
+        # e2 accepted first; accepting backdated e1 must re-anchor so every
+        # number above still holds
+        self.check_hand_computed(self.build([self.E2, self.E1]))
+
+
 if __name__ == "__main__":
     unittest.main()
