@@ -42,7 +42,7 @@ testable invariants.
 ```
 python demo.py                          # a month of AI API traffic, end to end
 python bench.py --events 200000         # throughput micro-benchmark
-python -m unittest discover -s tests    # 26 tests
+python -m unittest discover -s tests    # 27 tests
 python -m burndown.server --port 8080   # ingest API
 ```
 
@@ -77,7 +77,7 @@ Three customers generate a month of token traffic. Along the way:
 `bench.py`, single-threaded and in-memory on a shared 2-vCPU cloud
 container:
 
-- ~200k events/s through ingest + accrual at 200k events (~187k/s at 1M)
+- ~200k events/s through ingest + accrual (173k-210k across runs at 200k events; ~187k/s at 1M)
 - full-ledger reconcile of 200k events: 0.42s
 
 This is a correctness study, not a load test; the number just shows the
@@ -90,15 +90,17 @@ per million units, so `quantity * cents_per_million` is exact integer math
 and rounding only happens once, at display.
 
 Live state (balances, accrual) is an incremental cache; the ledger is the
-source of truth. Invoices are always computed as a pure replay over the
-ledger, so they are correct no matter what order events arrived in. The
-live cache has one documented hard case: when events arrive out of order
-across a billing-period boundary and share a credit grant, which month a
-credit burn is *attributed* to can drift from replay truth (a November
-event can consume credits an earlier, not-yet-arrived October event should
-have used). `reconcile()` detects exactly this and repairs the cache - the
-same reason Stripe reconciles their real-time ratings against the ledger.
-`tests/test_stress.py` demonstrates the drift and the repair.
+source of truth, and invoices are always computed as a pure replay over it.
+The cache stays correct under out-of-order delivery: same-period reordering
+is provably harmless (per-grant burn totals are arrival-order invariant -
+there is a randomized test over 75 shuffled interleavings), and an accepted
+event dated in an *earlier* billing period triggers a targeted re-anchor -
+a replay of just that customer's history - so balances, billing, and credit
+attribution never go stale. `reconcile()` remains as a full audit: it
+rebuilds all state from the ledger and must always report a match, and
+handed the producer's copy of the stream it reports exactly which event ids
+were lost. This mirrors the split Stripe describes between real-time
+ratings and reconciliation.
 
 What this deliberately does **not** implement: the distributed
 infrastructure from the Stripe post - no event bus, no stream processor, no

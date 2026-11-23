@@ -106,6 +106,7 @@ class Engine:
         self._qty: dict = {}     # (customer, period, meter) -> units
         self._billed: dict = {}  # (customer, period) -> overage microcents
         self._burned: dict = {}  # (customer, period) -> credits burned microcents
+        self._max_period: dict = {}  # customer -> latest billing period applied
 
     # --- setup -----------------------------------------------------------
 
@@ -147,12 +148,44 @@ class Engine:
 
     def _apply(self, ev: UsageEvent) -> None:
         period = period_of(ev.timestamp)
+        max_period = self._max_period.get(ev.customer_id)
+        if max_period is not None and period < max_period:
+            # Cross-period out-of-order delivery: an earlier-month event can
+            # change how shared credit grants SHOULD have been attributed.
+            # Same-period reordering is provably harmless (burn totals are
+            # arrival-order invariant), but cross-period is not, so re-anchor
+            # this customer's live state from the ledger. No read can ever
+            # return stale money.
+            self._rebuild_customer(ev.customer_id)
+            return
+        self._max_period[ev.customer_id] = period if max_period is None else max(period, max_period)
+        self._apply_incremental(ev)
+
+    def _apply_incremental(self, ev: UsageEvent) -> None:
+        period = period_of(ev.timestamp)
         key = (ev.customer_id, period, ev.meter)
         price = self.pricing[ev.meter]
         q0 = self._qty.get(key, 0)
         delta = price.cost_microcents(q0 + ev.quantity) - price.cost_microcents(q0)
         self._qty[key] = q0 + ev.quantity
         self._charge(ev.customer_id, period, delta, ev.timestamp, self.grants, self._billed, self._burned)
+
+    def _rebuild_customer(self, customer_id: str) -> None:
+        """Targeted repair: replay one customer's ledger history into live state."""
+        self._qty = {k: v for k, v in self._qty.items() if k[0] != customer_id}
+        self._billed = {k: v for k, v in self._billed.items() if k[0] != customer_id}
+        self._burned = {k: v for k, v in self._burned.items() if k[0] != customer_id}
+        for g in self.grants:
+            if g.customer_id == customer_id:
+                g.remaining_micro = g.cents * MICRO
+        for ev in sorted(
+            self.ledger.events(customer_id=customer_id),
+            key=lambda e: (e.timestamp, e.event_id),
+        ):
+            self._apply_incremental(ev)
+            period = period_of(ev.timestamp)
+            if period > self._max_period.get(customer_id, ""):
+                self._max_period[customer_id] = period
 
     @staticmethod
     def _charge(customer_id, period, micro, now, grants, billed, burned) -> None:
@@ -226,7 +259,10 @@ class Engine:
     # --- reconciliation --------------------------------------------------
 
     def reconcile(self, external_events=None) -> dict:
-        """Rebuild live state from the ledger and report any drift.
+        """Audit pass: rebuild live state from the ledger and report any drift.
+
+        With re-anchoring on out-of-order ingest this should always match;
+        a mismatch here means a bug, and the fresh state is adopted anyway.
 
         With external_events (an iterable of raw payloads, e.g. the producer's
         copy of the stream), also report which event ids are missing from the

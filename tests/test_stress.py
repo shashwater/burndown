@@ -4,8 +4,8 @@ with the engine's own invariants.
 - A fully hand-computed invoice (expected dollar figures derived here, not
   by the engine).
 - Arrival-order invariance: shuffled interleavings across customers and
-  months must produce byte-identical invoices and balances, including late
-  events that cross credit-grant expiry boundaries.
+  months must produce identical invoices AND live balances, including
+  backdated events that cross month and credit-grant expiry boundaries.
 - Exact tier boundaries and rounding.
 - Idempotency-key conflicts (same id, different payload).
 """
@@ -37,8 +37,7 @@ class TestHandComputedInvoice(unittest.TestCase):
       Nov 3:  input 4M  -> 4M * $2.50/1M = $10.00
       Nov 10: output 5M -> 5M * $10/1M   = $50.00
       Nov 20: input 8M  -> $20.00
-      Nov 25: output 12M-> marginal from 5M to 17M: 5M*$10/1M + 2M*$8/1M = $66.00
-               wait: marginal = cost(17M) - cost(5M) = $156 - $50 = $106.00
+      Nov 25: output 12M-> marginal = cost(17M) - cost(5M) = $156 - $50 = $106.00
 
     Lines (per-period totals): input 12M = $30.00; output 17M
       = 10M*$10/1M + 7M*$8/1M = $156.00. Gross $186.00.
@@ -99,7 +98,7 @@ class TestTierBoundariesAndRounding(unittest.TestCase):
         for i in range(10_000):
             engine.ingest(ev(f"r{i}", "c_r", "input_tokens", 3, NOV1 + i))
         inv = engine.invoice("c_r", "2025-11")
-        # 30,000 units * 250 microcents = 7,500,000 microcents = $0.075 -> 7.5 cents, exact
+        # 30,000 units * 250 microcents = 7,500,000 microcents = $0.075, exact
         self.assertEqual(inv.gross_micro, 7_500_000)
 
 
@@ -122,23 +121,19 @@ class TestIdempotencyConflict(unittest.TestCase):
 
 class TestArrivalOrderInvariance(unittest.TestCase):
     """Randomized property: any arrival interleaving - across customers,
-    months, and grant-expiry boundaries - yields identical invoices,
-    balances, and a clean reconcile."""
+    months, and grant-expiry boundaries - yields identical invoices and
+    balances, and the reconcile audit always agrees with the live cache."""
 
     def scenario(self, rng):
         engine = make_engine()
-        # grants engineered to straddle event timestamps
         engine.add_credits("c_a", 3000, expires_at=NOV1 + 10 * DAY, grant_id="a_exp")
         engine.add_credits("c_a", 2000, grant_id="a_open")
         engine.add_credits("c_b", 1500, expires_at=NOV1 + 20 * DAY, grant_id="b_exp")
         events = []
-        seq = 0
-        for _ in range(120):
-            seq += 1
+        for seq in range(120):
             cust = rng.choice(["c_a", "c_b", "c_c"])
             meter = rng.choice(["input_tokens", "output_tokens"])
-            # timestamps across Oct 20 - Dec 10, crossing the Nov boundary
-            ts = NOV1 + rng.uniform(-12, 39) * DAY
+            ts = NOV1 + rng.uniform(-12, 39) * DAY  # Oct 20 - Dec 10
             events.append(ev(f"s{seq}", cust, meter, rng.randint(100, 2_000_000), ts))
         return engine, events
 
@@ -163,17 +158,12 @@ class TestArrivalOrderInvariance(unittest.TestCase):
                 engine, _ = self.scenario(rng)
                 for raw in shuffled:
                     engine.ingest(raw)
-                # invoices are pure replay: always identical, even before reconcile
-                self.assertEqual(
-                    {k: v for k, v in self.totals(engine, customers, periods).items() if k[0] != "bal"},
-                    {k: v for k, v in reference.items() if k[0] != "bal"},
-                    f"seed={seed} shuffle={shuffle_seed}")
-                # the live cache may drift on adversarial orderings; reconcile repairs it
-                engine.reconcile()
+                # live state (incl. balances) must equal replay truth directly:
+                # cross-period out-of-order events trigger a targeted re-anchor
                 self.assertEqual(self.totals(engine, customers, periods), reference,
-                                 f"post-reconcile seed={seed} shuffle={shuffle_seed}")
-                self.assertTrue(engine.reconcile()["matched"],
-                                f"stable after repair seed={seed} shuffle={shuffle_seed}")
+                                 f"seed={seed} shuffle={shuffle_seed}")
+                report = engine.reconcile()
+                self.assertTrue(report["matched"], f"seed={seed} shuffle={shuffle_seed}: {report}")
 
     def test_late_event_predating_grant_expiry_still_burns_it(self):
         # grant expires Nov 10; event timestamped Nov 5 arrives Nov 25.
@@ -188,20 +178,14 @@ class TestArrivalOrderInvariance(unittest.TestCase):
         self.assertTrue(engine.reconcile()["matched"])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestCrossPeriodReAnchor(unittest.TestCase):
+    """Cross-period out-of-order delivery: an earlier-month event accepted
+    after a later-month one must leave every externally visible number
+    correct immediately - balances, per-period billing, and credit
+    attribution. The engine re-anchors the affected customer's live state
+    from the ledger on such events, so no read can return stale money."""
 
-
-class TestCrossPeriodDriftAndRepair(unittest.TestCase):
-    """The known hard case, documented: shared credit grants + out-of-order
-    arrival across a period boundary. Which MONTH a credit burn is attributed
-    to depends on arrival order in the live cache (a Nov event can consume
-    credits that an earlier, not-yet-arrived Oct event should have used).
-    Invoices are pure replay, so they are correct throughout; reconcile()
-    detects and repairs the live attribution drift. This is the same reason
-    Stripe reconciles real-time ratings against the ledger."""
-
-    def test_drift_then_repair(self):
+    def test_out_of_order_acceptance_is_immediately_correct(self):
         e_oct = ev("oct", "c_d", "input_tokens", 8_000_000, NOV1 - 6 * DAY)  # $20, Oct 26
         e_nov = ev("nov", "c_d", "input_tokens", 8_000_000, NOV1 + 4 * DAY)  # $20, Nov 5
 
@@ -212,21 +196,27 @@ class TestCrossPeriodDriftAndRepair(unittest.TestCase):
                 engine.ingest(raw)
             return engine
 
-        adversarial = build([e_nov, e_oct])  # November event ingested first
+        adversarial = build([e_nov, e_oct])  # November event accepted first
         ordered = build([e_oct, e_nov])
 
-        # invoices (pure replay) agree even before any reconcile
-        self.assertEqual(adversarial.invoice("c_d", "2025-10"), ordered.invoice("c_d", "2025-10"))
-        self.assertEqual(adversarial.invoice("c_d", "2025-11"), ordered.invoice("c_d", "2025-11"))
         # correct attribution: October's $20 burns credits first, November bills $10
-        self.assertEqual(ordered.invoice("c_d", "2025-10").amount_due_micro, 0)
-        self.assertEqual(ordered.invoice("c_d", "2025-11").amount_due_micro, 1000 * MICRO)
+        for engine in (adversarial, ordered):
+            self.assertEqual(engine.invoice("c_d", "2025-10").amount_due_micro, 0)
+            self.assertEqual(engine.invoice("c_d", "2025-11").amount_due_micro, 1000 * MICRO)
+            self.assertEqual(engine.balance_cents("c_d", now=NOV1 + 30 * DAY), 0)
+            self.assertTrue(engine.reconcile()["matched"])
 
-        # the adversarial live cache drifted; reconcile detects and repairs it
-        report = adversarial.reconcile()
-        self.assertFalse(report["matched"])
-        self.assertTrue(adversarial.reconcile()["matched"])  # stable after repair
-        self.assertEqual(adversarial.balance_cents("c_d", now=NOV1 + 30 * DAY), 0)
+    def test_balance_immediately_correct_after_backdated_event(self):
+        engine = make_engine()
+        engine.add_credits("c_d", 3000, expires_at=NOV1 + 9 * DAY, grant_id="g_exp")
+        engine.add_credits("c_d", 2000, grant_id="g_open")
+        engine.ingest(ev("nov", "c_d", "input_tokens", 20_000_000, NOV1 + 14 * DAY))  # $50, Nov 15
+        # a $50 event dated Oct 26 arrives after: Oct usage burns all credits first
+        engine.ingest(ev("oct", "c_d", "input_tokens", 20_000_000, NOV1 - 6 * DAY))
+        self.assertEqual(engine.invoice("c_d", "2025-10").amount_due_micro, 0)
+        self.assertEqual(engine.invoice("c_d", "2025-11").amount_due_micro, 5000 * MICRO)
+        self.assertEqual(engine.balance_cents("c_d", now=NOV1 + 30 * DAY), 0)
+        self.assertTrue(engine.reconcile()["matched"])
 
 
 if __name__ == "__main__":
